@@ -44,7 +44,7 @@ class DocumentsRepository:
                     "has_financial_data": document.has_financial_data,
                     "currency": document.currency,
                     "total_amount": document.total_amount,
-                } if document.document_type else None
+                } if (document.document_type or document.has_financial_data or document.currency or document.total_amount is not None) else None
 
                 cursor.execute(sql, (
                     document.id,
@@ -53,8 +53,8 @@ class DocumentsRepository:
                     document.storage_path,
                     document.file_size,
                     document.status,
-                    None,  # project_id - can be set later
-                    None,  # client_id - can be set later
+                    document.project_id,
+                    document.client_id,
                     metadata,
                     document.created_at
                 ))
@@ -92,6 +92,8 @@ class DocumentsRepository:
                     file_size=row["file_size"],
                     raw_text=None,  # TODO: load from file if needed
                     storage_path=row["file_path"],
+                    project_id=row.get("project_id"),
+                    client_id=row.get("client_id"),
                     created_at=row["uploaded_at"],
                     updated_at=row["uploaded_at"],  # TODO: track updates
                     document_type=document_type,
@@ -114,6 +116,22 @@ class DocumentsRepository:
                 conn.commit()
                 return cursor.rowcount > 0
 
+    def mark_indexed(self, document_id: str, chunk_count: int) -> bool:
+        """Mark a document as indexed and store chunk_count + indexed_at."""
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE documents
+                    SET status = %s,
+                        chunk_count = %s,
+                        indexed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE doc_id = %s
+                """, ("indexed", chunk_count, document_id))
+
+                conn.commit()
+                return cursor.rowcount > 0
+
     def list_documents(self, project_id: Optional[str] = None, limit: int = 100) -> List[DocumentModel]:
         """List documents, optionally filtered by project."""
         with self._get_connection() as conn:
@@ -121,7 +139,7 @@ class DocumentsRepository:
                 if project_id:
                     cursor.execute("""
                         SELECT doc_id, filename, source_type, file_path, file_size, status,
-                               metadata, uploaded_at
+                               project_id, client_id, metadata, uploaded_at
                         FROM documents
                         WHERE project_id = %s AND deleted_at IS NULL
                         ORDER BY uploaded_at DESC
@@ -130,7 +148,7 @@ class DocumentsRepository:
                 else:
                     cursor.execute("""
                         SELECT doc_id, filename, source_type, file_path, file_size, status,
-                               metadata, uploaded_at
+                               project_id, client_id, metadata, uploaded_at
                         FROM documents
                         WHERE deleted_at IS NULL
                         ORDER BY uploaded_at DESC
@@ -148,6 +166,8 @@ class DocumentsRepository:
                 mime_type="application/octet-stream",  # TODO: determine from file
                 file_size=row["file_size"],
                 storage_path=row["file_path"],
+                project_id=row.get("project_id"),
+                client_id=row.get("client_id"),
                 created_at=row["uploaded_at"],
                 status=row["status"],
                 document_type=metadata.get("document_type"),

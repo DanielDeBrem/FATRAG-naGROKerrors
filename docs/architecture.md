@@ -112,3 +112,183 @@ tests/                   # Test suite
 6. **Configuration**: Centralized settings management
 7. **Logging**: Structured logging throughout
 8. **Testing**: Unit and integration tests for each layer
+
+## Document Ingestion & Analysis Pipeline (Target Design)
+
+Doel: een duidelijke, herhaalbare pipeline van ruwe upload → hoogwaardige advies-output, met per stap controle en uitbreidbaarheid.
+
+### 1. Upload & opslag origineel bestand
+
+**Stap:**
+- User uploadt file via:
+  - `/admin/projects/{project_id}/upload`
+  - of een generieke `/documents/upload`-endpoint.
+
+**Acties:**
+- *Validatie* (service: `DocumentIngestService`):
+  - Extensie/MIME (PDF, TXT, MD, XLSX, DOCX, etc.).
+  - Bestandsgrootte (max X MB).
+- *Opslag in filesystem*:
+  - `fatrag_data/uploads/<doc_id>_<originele_naam>.<ext>`.
+- *Opslag in SQL* (tabel `documents`):
+  - `doc_id` (bijv. `doc-xxxx`).
+  - `project_id`, `client_id`.
+  - `filename`, `file_path`, `file_size`.
+  - `source_type = 'project_upload'`.
+  - `status = 'uploaded'`.
+  - `metadata` (JSON) initieel leeg of minimale info.
+
+### 2. Normalisatie naar tekst/MD/JSON
+
+**Doel:** één consistente representatie per document, geschikt voor LLM & analyses.
+
+**Stap:**
+- Extractie:
+  - PDF → platte tekst.
+  - XLSX/XLS → relevante tabellen/cellen → tekst/JSON.
+  - DOCX → tekst (python-docx).
+  - TXT/MD → direct leesbaar.
+
+**Acties:**
+- *Normalisatie*:
+  - Schoonmaken van headers/footers.
+  - Wegfilteren van ruis (paginanummers, watermerken).
+  - Opslaan in:
+    - filesystem als `.md` of `.json`, én/of
+    - SQL in aparte kolommen, bijv.:
+      - `normalized_text` (LONGTEXT) voor MD/tekst.
+      - `normalized_json` (JSON) voor gestructureerde data.
+- *Statusupdate*:
+  - `status = 'normalized'`.
+
+### 3. Documentclassificatie (soort document)
+
+**Doel:** elk document krijgt een semantisch type, zodat we gerichte analyses kunnen doen.
+
+**Voorbeelden van types:**
+- `jaarrekening`
+- `contract`
+- `belastingaanslag`
+- `financiele_memo`
+- `(arbeids)overeenkomst`
+- `taxatie`
+- `notariele_akte`
+- etc.
+
+**Stap:**
+- Classificatie-service (bijv. `document_classifier.py`):
+  - Input: `normalized_text` (en evt. metadata).
+  - Model: rule-based + LLM (prompt-gestuurd).
+- Output wordt opgeslagen in:
+  - `documents.metadata.document_type`.
+  - Eventueel extra velden (jaartal, tegenpartij, bedragscategorie).
+
+**Statusupdate:**
+- `status = 'classified'`.
+
+### 4. Chunking & Embedding
+
+**Doel:** documenten bevraagbaar maken (RAG) en hergebruik voor analyses.
+
+**Stap:**
+- Chunking:
+  - Op basis van `normalized_text`.
+  - Configurabel via `chunk_size`, `chunk_overlap` (zie `Settings`).
+  - Iedere chunk → `DocumentChunk` (in code) met:
+    - `document_id`, `index`, `text`, `metadata` (type, jaar, partijen, etc.).
+- Embedding:
+  - Via Ollama embeddings (`OllamaEmbeddings`).
+  - Wegschrijven naar vectorstore (ChromaDB):
+    - Collection per project of globale collectie met `project_id`-filter.
+- Optioneel: chunk-rows in MySQL (tabel `document_chunks`) met referentie naar vectorstore-ID.
+
+**Statusupdate:**
+- `status = 'indexed'`.
+- `metadata.has_financial_data`, `metadata.currency`, `metadata.total_amount` kunnen in deze stap al deels afgeleid worden uit de chunks.
+
+### 5. Bevraagbaarheid door LLM (RAG-laag)
+
+**Doel:** interactief vragen kunnen stellen per project/document.
+
+**Stap:**
+- RAG-keten (`build_qa_chain` in `main.py`):
+  - Gebruikt vectorstore als retriever.
+  - Filter op:
+    - `project_id`
+    - optioneel `client_id`
+    - `document_type` (voor gerichte vragen).
+- Antwoord prompt-gestuurd (FinAdviseur-NL stijl), met keten:
+  - Query → retrieve relevante chunks → LLM synthese.
+
+### 6. Standaard analyses per documenttype
+
+**Doel:** één klik “standaard analyse” voor elk documenttype, zodat de adviseur altijd een consistente baseline heeft.
+
+**Voorbeelden:**
+- Jaarrekening:
+  - Ratio’s (solvabiliteit, rentabiliteit).
+  - Trendanalyse 3–5 jaar.
+  - Cashflow-inzichten.
+- Contract:
+  - Belangrijkste verplichtingen.
+  - Termijnen / opzegtermijnen.
+  - Risico-clausules.
+- Belastingaanslag:
+  - Aanslagbedrag vs. verwachting.
+  - Termijnen / bezwaar.
+  - Kansen en risico’s.
+- Notariële akte:
+  - Eigendomsoverdracht / structuur.
+  - Relevante fiscale regimes.
+  - Latente belastingposities.
+
+**Implementatie-idee:**
+- Per `document_type` één of meer “analysis templates”:
+  - Prompt-tekst + parameters (model, max tokens, temperature).
+  - Opslag in configuratie (later beheerbaar via instellingenpagina).
+- Service-laag:
+  - Haalt relevante chunks/documents + context op.
+  - Voert LLM-call uit op basis van type-specifieke prompt.
+  - Slaat output op als nieuw document:
+    - `source_type = 'llm_analysis'` of gedetailleerder, bijv. `'analysis:jaarrekening'`.
+    - Bestandsnaam in `fatrag_data/uploads/` + entry in `documents`.
+
+### 7. Instellingenpagina (toekomst)
+
+**Doel:** per soort analyse het LLM-gedrag fijnregelen.
+
+**Voor elke analyseconfiguratie:**
+- Model (bijv. `llama3.1:8b`, `qwen2.5:7b`).
+- Temperature, max_tokens.
+- Chunking-instellingen (size/overlap).
+- Prompt-tekst (met placeholders).
+- Outputformaat (MD, PDF, CSV, …).
+
+**Frontend:**
+- Nieuwe admin-pagina (bijv. `static/admin/llm-config.html` uitbreiden) met:
+  - Lijst van documenttypes.
+  - Per type de beschikbare standaardanalyses.
+  - Edit/save van prompts en LLM-parameters.
+
+**Backend:**
+- Opslag in `config.json` of aparte `analysis_templates`-tabel.
+- API’s onder `/admin/config/analysis-templates`.
+
+---
+
+### Status t.o.v. huidige code
+
+- **Deels aanwezig:**
+  - Upload + opslag op disk (`ingestion.py`, `DocumentIngestService`, `/admin/projects/{project_id}/upload`).
+  - SQL-opslag in `documents` (via `DocumentsRepository` en raw SQL in `main.py`).
+  - Chunking + embeddings (vectorstore/Chroma, RAG-keten).
+  - LLM-analyse pipelines (flash, full, FATRAG).
+
+- **Nog te bouwen / te harmoniseren:**
+  - Eenduidige normalisatie-laag (MD/JSON) + velden in DB (`normalized_text`, `normalized_json`).
+  - Structurele documentclassificatie (`document_type` invullen voor alle documenten).
+  - Consequente status-flow (`uploaded` → `normalized` → `classified` → `indexed` → geanalyseerd).
+  - Standaardanalyse per type (templates + services).
+  - Instellingenpagina voor LLM per analyse-type.
+
+Deze pipelinebeschrijving is de **doelarchitectuur** waar de codebase stap voor stap naartoe refactored kan worden.

@@ -195,3 +195,110 @@ Reply with:
 - Other questions → I answer them
 
 Let's make this REAL! 🚀
+
+---
+
+## 🔁 Volgende Roadmap: Ingestion Pipeline & AVG-proof Anonimisering
+
+Dit is de stap-voor-stap route om van de huidige situatie naar jouw ideale pipeline te gaan (inclusief latere AVG-proof anonimisatie voor cloud LLM’s).
+
+### Fase A – Basis ingest & status-flow (klein en veilig)
+
+Doel: upload-flow consistent maken en statusvelden gebruiken zonder grote breuken.
+
+- [ ] `documents`-tabel uitbreiden met velden (of bevestigen dat ze bestaan):
+  - `status` (uploaded / normalized / classified / indexed / analyzed)
+  - `metadata` (JSON) voor o.a. `document_type`, `has_financial_data`, `currency`, `total_amount`
+- [ ] `DocumentIngestService` + `/admin/projects/{project_id}/upload` harmoniseren:
+  - Altijd:
+    - originele file → `fatrag_data/uploads`
+    - entry in `documents` met `source_type = 'project_upload'`
+    - `status = 'uploaded'`
+- [ ] Bestaande code paden (oude ingest) aanpassen zodat ze dezelfde `status`-flow gebruiken.
+
+**Resultaat:** elke upload heeft een nette DB-entry met een beginstatus en metadata-veld.
+
+### Fase B – Normalisatie-laag (tekst / MD / JSON)
+
+Doel: één consistente representatie van documenten vóór classificatie en embeddings.
+
+- [ ] Nieuwe service `document_extractors.py`:
+  - PDF → tekst
+  - XLSX → JSON/tekst
+  - DOCX → tekst
+  - TXT/MD → tekst
+- [ ] Per document:
+  - `normalized_text` (of MD) opslaan (DB of file)
+  - optioneel `normalized_json`
+  - `status = 'normalized'`
+- [ ] Integreren in ingest-pipeline als afzonderlijke stap (background job mogelijk).
+
+**Resultaat:** alle documenten hebben een genormaliseerde vorm die klaar is voor classificatie en chunking.
+
+### Fase C – Classificatie (soort document)
+
+Doel: elk document typeren (jaarrekening, contract, belastingaanslag, …).
+
+- [ ] Nieuwe service `document_classifier.py`:
+  - Input: `normalized_text` + metadata
+  - Output: `document_type` + extra labels (jaar, partijen, etc.)
+- [ ] `documents.metadata.document_type` vullen en `status = 'classified'`.
+- [ ] Eenvoudige admin-overzicht toevoegen (welke documenten welk type hebben).
+
+**Resultaat:** je kunt in de UI/filtering per documenttype werken en straks type-specifieke analyses draaien.
+
+### Fase D – Chunk & Embed refactor (projectbewust)
+
+Doel: RAG-laag opschonen en laten aansluiten op nieuwe metadata.
+
+- [ ] Chunking-service laten werken op `normalized_text`:
+  - Config uit `Settings` (chunk_size, chunk_overlap).
+  - Chunks annoteren met `project_id`, `client_id`, `document_type`, kern-metadata.
+- [ ] Embeddings:
+  - Uniforme entrypoint voor vectorstore (één adapter).
+  - Filters op `project_id` en `document_type` afdwingen in retrievers.
+- [ ] `status = 'indexed'` wanneer chunks + embeddings klaar zijn.
+
+**Resultaat:** stabiele, goed gefilterde RAG-laag, per project en per documenttype.
+
+### Fase E – Standaardanalyses per documenttype
+
+Doel: one-click analyses per type (jaarrekening, contract, etc.).
+
+- [ ] Template-config (bijv. in `config.json` of aparte tabel) voor:
+  - `document_type` → lijst analyses (naam, prompt, model, parameters).
+- [ ] Service-laag:
+  - Zoekt relevante chunks op basis van type.
+  - Voert LLM-call uit volgens template.
+  - Slaat output op als nieuw document met `source_type` bv. `analysis:jaarrekening`.
+- [ ] Admin-UI:
+  - Per project en type een “Start standaardanalyse”-knop.
+
+**Resultaat:** kwalitatief consistente, herhaalbare analyses per documentsoort.
+
+### Fase F – AVG-proof Anonimisering (voor cloud LLM’s)
+
+Doel: een aparte module om documenten/chunks te ontdoen van PII voordat ze naar een cloud LLM gaan.
+
+- [ ] Nieuwe service `anonymization.py`:
+  - Detecteert PII (namen, BSN, adressen, IBAN, kentekens, e-mails, etc.).
+  - Vervangt met placeholders (`[PERSOON_1]`, `[ADRES_1]`, …).
+  - Houdt een mapping bij zodat je (optioneel) achteraf kunt terugmappen.
+- [ ] Integratiepunt in pipeline:
+  - Voor cloud-routes (`is_cloud_model(...) == True`):
+    - Gebruik `anonymize(text)` → LLM → des-anonimiseren in rapport (indien nodig).
+  - Voor lokale modellen: optie om native (niet-geanonimiseerde) tekst te gebruiken.
+- [ ] Config-vlaggen:
+  - Per analyse-type/LLM-config:
+    - `require_anonymization_for_cloud: bool`.
+
+**Resultaat:** je kunt veilig cloud LLM’s gebruiken zonder AVG-risico, met een duidelijke plek in de pipeline waar anonimisering gebeurt.
+
+Deze roadmap staat naast de bestaande Progressive Testing-plannen in `PRODUCTION_IMPLEMENTATION_PLAN.md` en maakt het mogelijk om de ingest-pipeline én AVG-proof anonimisering stap voor stap te implementeren zonder de huidige werking in één keer omver te trekken.
+</result>
+<task_progress>
+- [x] Inspect existing production implementation plan
+- [x] Add a phased, step-by-step roadmap for the new ingestion pipeline
+- [x] Expliciet een latere fase voor AVG-proof anonimisering opgenomen
+- [x] Fases klein en opeenvolgend gemaakt (A–F)
+</task_progress>

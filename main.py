@@ -5,6 +5,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from app.services.embeddings import EmbeddingsService
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -416,15 +417,34 @@ def build_llm_from_config(cfg: Dict[str, Any]) -> ChatOllama:
     )
 
 
-def build_qa_chain(cfg: Dict[str, Any], lang_hint: str = "", tone_phrases: str = "", prompt: PromptTemplate = PROMPT, search_filter: Optional[Dict[str, Any]] = None) -> RetrievalQA:
+def build_qa_chain(
+    cfg: Dict[str, Any],
+    lang_hint: str = "",
+    tone_phrases: str = "",
+    prompt: PromptTemplate = PROMPT,
+    search_filter: Optional[Dict[str, Any]] = None,
+) -> RetrievalQA:
+    """Bouw een QA-keten met een retriever die project-/client-/typefilters ondersteunt.
+
+    Let op:
+    - EmbeddingsService.get_retriever() gebruikt metadata als project_id/client_id/document_type
+      die tijdens indexeren in de vectorstore zijn gezet.
+    - search_filter (indien meegegeven) wordt gemerged als extra filter.
+    """
     k = int(cfg.get("RETRIEVER_K", 5) or 5)
-    search_kwargs = {"k": k}
-    if search_filter:
-        search_kwargs["filter"] = search_filter
+
+    # EmbeddingsService zorgt voor consistente filters & toegang tot vectorstore
+    retriever = EmbeddingsService.get_retriever(
+        k=k,
+        # project_id/client_id worden al in search_filter gezet in /query; hier gebruiken we
+        # extra_filter om bestaande logica niet te breken en toch centrale filtering te hebben.
+        extra_filter=search_filter or {},
+    )
+
     return RetrievalQA.from_chain_type(
         llm=build_llm_from_config(cfg),
         chain_type="stuff",
-        retriever=vectorstore.as_retriever(search_kwargs=search_kwargs),
+        retriever=retriever,
         chain_type_kwargs={"prompt": prompt.partial(lang_hint=lang_hint, tone_phrases=tone_phrases)},
     )
 
@@ -935,6 +955,10 @@ async def admin_analyses(_: bool = Depends(admin_required)):
 @app.get("/admin/llm-config.html")
 async def admin_llm_config(_: bool = Depends(admin_required)):
     return FileResponse("static/admin/llm-config.html")
+
+@app.get("/admin/pipeline-config.html")
+async def admin_pipeline_config(_: bool = Depends(admin_required)):
+    return FileResponse("static/admin/pipeline-config.html")
 
 @app.get("/admin/upload-progress.html")
 async def admin_upload_progress(_: bool = Depends(admin_required)):

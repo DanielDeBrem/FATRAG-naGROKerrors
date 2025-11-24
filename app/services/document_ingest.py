@@ -9,6 +9,8 @@ from app.models.domain import Document as DocumentModel
 from app.models.dto.upload import UploadResponse
 from app.repositories.documents import DocumentsRepository
 from app.core.config import get_settings
+from app.services.document_classifier import DocumentClassifierService
+from app.services.document_index import DocumentIndexService
 
 # Import text extraction functions from existing ingestion module
 from ingestion import (
@@ -18,6 +20,7 @@ from ingestion import (
     clean_extracted_text,
     ensure_dirs
 )
+from app.services.document_extractors import extract_for_db
 
 
 class DocumentIngestService:
@@ -26,6 +29,8 @@ class DocumentIngestService:
     def __init__(self):
         self.settings = get_settings()
         self.repository = DocumentsRepository()
+        self.classifier = DocumentClassifierService()
+        self.indexer = DocumentIndexService()
 
     def _validate_file(self, file: UploadFile) -> None:
         """Validate uploaded file."""
@@ -135,14 +140,38 @@ class DocumentIngestService:
             # Save file to disk
             file_path = self._save_file_to_disk(file, document_id)
 
-            # Get file size
+            # Get initial file size from disk
             file_size = os.path.getsize(file_path)
 
             # Determine MIME type
             mime_type = self._determine_mime_type(file.filename, file_path)
 
-            # Extract text (this can be expensive for large PDFs)
-            raw_text = self._extract_text_from_file(file_path) if file_size < 10 * 1024 * 1024 else None  # Skip text extraction for files > 10MB
+            # Normalization / extraction (can be expensive for large PDFs)
+            raw_text = None
+            status = "uploaded"
+
+            # Only attempt full text extraction for files < 10MB for now
+            if file_size < 10 * 1024 * 1024:
+                try:
+                    # Use shared normalization service (Fase B)
+                    normalized_text, normalized_size = extract_for_db(file_path)
+                    raw_text = normalized_text
+                    # Prefer normalized_size if available, otherwise keep original size
+                    file_size = normalized_size or file_size
+                    status = "normalized"
+                except Exception:
+                    # Fallback: best-effort extraction via legacy helper
+                    raw_text = self._extract_text_from_file(file_path)
+                    status = "processed"
+
+            # Optional classificatie (Fase C): alleen als we tekst hebben
+            document_type = None
+            if raw_text:
+                try:
+                    cls = self.classifier.classify(raw_text, file.filename or "")
+                    document_type = cls.document_type
+                except Exception:
+                    document_type = None
 
             # Create domain model
             document = DocumentModel(
@@ -152,11 +181,20 @@ class DocumentIngestService:
                 file_size=file_size,
                 raw_text=raw_text,
                 storage_path=file_path,
-                status="processed"  # Mark as processed since we've extracted text
+                status=status,
+                document_type=document_type,
             )
 
             # Save to repository
             saved_document = self.repository.save_document(document)
+
+            # Index in vectorstore (Fase D) – best effort, faalt niet de upload
+            try:
+                if saved_document.raw_text:
+                    self.indexer.index_document(saved_document)
+            except Exception:
+                # Indexering mag ingest niet doen falen
+                pass
 
             return UploadResponse(
                 document_id=saved_document.id,

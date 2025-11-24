@@ -1,0 +1,56 @@
+project_root: /home/daniel/Projects/FATRAG
+endpoints:
+  - http://127.0.0.1:11434
+  - http://127.0.0.1:11435
+  - http://127.0.0.1:11436
+  - http://127.0.0.1:11437
+  - http://127.0.0.1:11438
+  - http://127.0.0.1:11439
+  - http://127.0.0.1:11440
+  - http://127.0.0.1:11441
+vectordb:
+  type: chroma
+  conn_string: /home/daniel/Projects/FATRAG/fatrag_chroma_db
+  collection: fatrag
+models:
+  l1: "llama3.1:70b"
+  l2: "llama3.1:70b"
+  final: "llama3.1:70b"
+  inventory:
+    - gpt-oss:120b-cloud
+    - qwen3-embedding:8b
+    - qwen2.5:7b-instruct
+    - qwen2.5:7b-instruct-q4_K_M
+    - llama3.1:8b-instruct-q4_K_M
+    - mxbai-embed-large:latest
+    - qwen3:32b
+    - DC1LEX/nomic-embed-text-v1.5-multimodal:latest
+    - nomic-embed-text:latest
+    - gemma2:2b
+    - llama3.1:70b
+    - mixtral:8x7b
+    - llava:13b
+    - llama3:latest
+    - llava:latest
+    - mistral:latest
+    - gemma2:2b-instruct-q3_K_M
+    - gemma2:2b-instruct-q4_K_M
+    - gemma3:27b
+    - mistral:7b
+    - phi3:3.8b
+    - gemma3:4b
+    - gemma3:12b
+    - llama3.1:8b
+  warnings:
+
+retrieval:
+  topK_default: 200
+temps:
+  l1: 0.7
+  l2: 0.7
+  final: 0.7
+parallel:
+  max_inflight_per_gpu: 4
+timeouts:
+  connect_s: 5
+  read_s: 30

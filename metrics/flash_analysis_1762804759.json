@@ -1,0 +1,27 @@
+{
+  "run_id": "flash_analysis_1762804759",
+  "job_id": "test_123",
+  "analysis_type": "flash_analysis",
+  "config": {
+    "model": "llama3.1:8b",
+    "temperature": 0.1
+  },
+  "start_time": "2025-11-10T20:59:19.431761",
+  "end_time": "2025-11-10T20:59:19.431986",
+  "duration_seconds": 0.000225,
+  "stages": [],
+  "tokens": {
+    "prompt": 0,
+    "completion": 0,
+    "total": 0
+  },
+  "quality_scores": {
+    "test": 1.0
+  },
+  "errors": [],
+  "status": "completed",
+  "result_summary": {
+    "output_length": 18,
+    "has_error": false
+  }
+}

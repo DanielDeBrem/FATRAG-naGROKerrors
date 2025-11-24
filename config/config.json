@@ -1,0 +1,10 @@
+{
+  "LLM_MODEL": "llama3.1:70b",
+  "EMBED_MODEL": "gemma2:2b",
+  "OLLAMA_BASE_URL": "http://localhost:11434",
+  "CHROMA_DIR": "./pieterman_chroma_db",
+  "CHROMA_COLLECTION": "pieterman",
+  "RETRIEVER_K": 5,
+  "TEMPERATURE": 0.7,
+  "FEEDBACK_ENABLED": true
+}

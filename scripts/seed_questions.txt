@@ -1,0 +1,11 @@
+# Seed diagnostische vragen voor FATRAG RAG evaluatie
+# Formaat: één vraag per regel
+# Type 1: Algemeen (breed)
+# Type 2: Datum/periode specifiek
+# Type 3: Entiteit/relatie specifiek
+
+Wat zijn de belangrijkste fiscale risico's die worden genoemd in de documenten?
+Welke bedragen en waarderingen worden genoemd voor De Brem?
+Wat is de aanbevolen aanpak voor de erfbelasting van familie Viergever?
+Welke BV's en holdings worden genoemd met hun aandeelhoudersstructuur?
+Wat zijn de fiscale consequenties van de voorgestelde herstructurering?

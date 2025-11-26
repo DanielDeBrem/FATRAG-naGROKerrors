@@ -29,6 +29,8 @@ class Document(BaseModel):
 
     id: str
     filename: str
+    # Bron in de DB-kolom source_type (bijv. upload, project_upload, llm_analysis, flash_analysis)
+    source_type: str = "upload"
     mime_type: str = "application/octet-stream"
     file_size: int = 0
 
@@ -43,7 +45,8 @@ class Document(BaseModel):
     client_id: Optional[str] = None
 
     # Lifecycle/status in the ingestion pipeline
-    status: str = "new"
+    # Typical values: uploaded, normalized, classified, indexed, analyzed, failed
+    status: str = "uploaded"
     error_message: Optional[str] = None
 
     # Optional semantic/financial metadata (stored in documents.metadata JSON)

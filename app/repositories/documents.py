@@ -3,7 +3,9 @@
 import os
 from typing import List, Optional
 from datetime import datetime
+import json
 import pymysql
+import clients_projects as cp
 from app.models.domain import Document as DocumentModel
 from app.core.config import get_settings
 
@@ -15,16 +17,10 @@ class DocumentsRepository:
         self.settings = get_settings()
 
     def _get_connection(self):
-        """Get database connection."""
-        return pymysql.connect(
-            host=self.settings.mysql_host,
-            port=self.settings.mysql_port,
-            user=self.settings.mysql_user,
-            password=self.settings.mysql_password,
-            database=self.settings.mysql_database,
-            charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
-        )
+        """Get database connection (shared with admin/services)."""
+        # Use the same connection factory as other admin endpoints to avoid
+        # diverging credentials (e.g. root@localhost vs dedicated app user).
+        return cp.get_db_connection()
 
     def save_document(self, document: DocumentModel) -> DocumentModel:
         """Save a document to the database."""
@@ -38,7 +34,7 @@ class DocumentsRepository:
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
 
-                # Prepare metadata JSON
+                # Prepare metadata JSON (als string, niet als dict, i.v.m. PyMySQL-parameters)
                 metadata = {
                     "document_type": document.document_type,
                     "has_financial_data": document.has_financial_data,
@@ -46,17 +42,19 @@ class DocumentsRepository:
                     "total_amount": document.total_amount,
                 } if (document.document_type or document.has_financial_data or document.currency or document.total_amount is not None) else None
 
+                metadata_param = json.dumps(metadata) if metadata is not None else None
+
                 cursor.execute(sql, (
                     document.id,
                     document.filename,
-                    "upload",  # Default source type for now
+                    document.source_type,
                     document.storage_path,
                     document.file_size,
                     document.status,
                     document.project_id,
                     document.client_id,
-                    metadata,
-                    document.created_at
+                    metadata_param,
+                    document.created_at,
                 ))
 
                 conn.commit()
@@ -78,8 +76,14 @@ class DocumentsRepository:
                 if not row:
                     return None
 
-                # Parse metadata
+                # Parse metadata (JSON kolom kan als string of dict terugkomen)
                 metadata = row.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except Exception:
+                        metadata = {}
+
                 document_type = metadata.get("document_type") if metadata else None
                 has_financial_data = metadata.get("has_financial_data", False) if metadata else False
                 currency = metadata.get("currency") if metadata else None
@@ -88,6 +92,7 @@ class DocumentsRepository:
                 return DocumentModel(
                     id=row["doc_id"],
                     filename=row["filename"],
+                    source_type=row.get("source_type", "upload"),
                     mime_type="application/octet-stream",  # TODO: determine from file
                     file_size=row["file_size"],
                     raw_text=None,  # TODO: load from file if needed
@@ -109,7 +114,7 @@ class DocumentsRepository:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     UPDATE documents
-                    SET status = %s, error_message = %s, updated_at = NOW()
+                    SET status = %s, error_message = %s
                     WHERE doc_id = %s
                 """, (status, error_message, document_id))
 
@@ -124,8 +129,7 @@ class DocumentsRepository:
                     UPDATE documents
                     SET status = %s,
                         chunk_count = %s,
-                        indexed_at = NOW(),
-                        updated_at = NOW()
+                        indexed_at = NOW()
                     WHERE doc_id = %s
                 """, ("indexed", chunk_count, document_id))
 
@@ -160,9 +164,16 @@ class DocumentsRepository:
         documents = []
         for row in rows:
             metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+
             documents.append(DocumentModel(
                 id=row["doc_id"],
                 filename=row["filename"],
+                source_type=row.get("source_type", "upload"),
                 mime_type="application/octet-stream",  # TODO: determine from file
                 file_size=row["file_size"],
                 storage_path=row["file_path"],

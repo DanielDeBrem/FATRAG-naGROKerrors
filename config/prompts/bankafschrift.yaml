@@ -1,0 +1,70 @@
+doc_type: "bankafschrift"
+
+prompts:
+  extract:
+    template: |
+      Je bent een financiële analist. Extraheer kerninformatie uit het onderstaande bankafschrift.
+      Focus op:
+      - rekeninghouder (naam) en rekeningnummer / IBAN
+      - banknaam (indien vermeld)
+      - periode (van/tot datum)
+      - beginsaldo en eindsaldo
+      - belangrijkste transacties (datum, omschrijving, tegenrekening, bedrag)
+      - totalen per categorie (indien mogelijk): inkomsten, vaste lasten, overige uitgaven
+      
+      Geef antwoord in geldig JSON met de volgende structuur:
+      {
+        "rekeninghouder": "...",
+        "rekeningnummer": "...",
+        "bank": "...",
+        "periode": {
+          "van": "...",
+          "tot": "..."
+        },
+        "beginsaldo": ...,
+        "eindsaldo": ...,
+        "transacties": [
+          {
+            "datum": "...",
+            "omschrijving": "...",
+            "tegenrekening": "...",
+            "bedrag": ...,
+            "valuta": "..."
+          }
+        ],
+        "samenvatting": {
+          "totaal_inkomsten": ...,
+          "totaal_uitgaven": ...,
+          "totaal_vaste_lasten": ...,
+          "totaal_overige_uitgaven": ...
+        }
+      }
+    max_context_tokens: 80000
+
+  summary:
+    template: |
+      Je bent een financieel analist. Vat het onderstaande bankafschrift samen.
+      - Beschrijf in maximaal 10 bullets:
+        - periode, rekeninghouder en rekeningnummer
+        - beginsaldo en eindsaldo
+        - globale cashflow (totaal inkomsten vs. uitgaven)
+        - belangrijkste soorten transacties (bijv. salaris, huur/hypotheek, belastingen, leningen)
+        - eventuele opvallende transacties (groot, ongebruikelijk of herhalend)
+      
+      TEKST:
+      {text}
+    max_context_tokens: 100000
+
+  risk:
+    template: |
+      Je bent een risicomanager. Analyseer het onderstaande bankafschrift op risico's en aandachtspunten:
+      - continuïteits- en liquiditeitsrisico (stabiele inkomsten vs. vaste lasten)
+      - signalen van betalingsproblemen (achterstanden, roodstand, frequente incasso's)
+      - ongebruikelijke transacties (onverwachte grote bedragen, herhaalde overboekingen naar onbekende rekeningen)
+      - concentratierisico (afhankelijkheid van één inkomen of één debiteur)
+      
+      Geef antwoord in puntsgewijze vorm, met "onvoldoende data" waar informatie ontbreekt.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 100000

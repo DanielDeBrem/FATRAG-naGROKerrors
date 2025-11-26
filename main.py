@@ -1,11 +1,14 @@
 from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse as FastAPIFileResponse
 from pydantic import BaseModel
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_ollama import ChatOllama
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from app.services.embeddings import EmbeddingsService
+from app.services.document_ingest import DocumentIngestService
+from app.repositories.prompts import PromptsRepository
+from app.models.dto.prompts import PromptDTO, DocTypePromptsDTO, PromptDocTypeOverviewDTO
+from document_prompts.store import load_prompts as load_prompt_store
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -299,18 +302,6 @@ class Query(BaseModel):
     client_id: Optional[str] = None
 
 # LLM will be built per request from app.state.config (see helpers below)
-
-# Embeddings (gemma2:2b voor efficiency)
-embed_model = OllamaEmbeddings(
-    model=EMBED_MODEL,
-    base_url=pick_worker_base_url()
-)
-
-vectorstore = Chroma(
-    persist_directory=CHROMA_DIR,
-    embedding_function=embed_model,
-    collection_name=CHROMA_COLLECTION
-)
 
 # FinAdviseur-NL prompt – Professional Financial & Tax Advisory
 prompt_template = """
@@ -709,6 +700,95 @@ async def admin_rollback_backup(body: Dict[str, Any], _: bool = Depends(admin_re
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ----- Prompt management -----
+prompt_repo = PromptsRepository()
+
+
+@app.get("/admin/prompts/doc-types")
+async def admin_list_prompt_doc_types(_: bool = Depends(admin_required)):
+    """
+    Lijst bekende doc_types + aantal prompts per type.
+    """
+    try:
+        rows = prompt_repo.list_doc_types()
+        items = [
+            PromptDocTypeOverviewDTO(
+                doc_type=str(row["doc_type"]),
+                prompt_count=int(row.get("prompt_count", 0)),
+                active_prompts=int(row.get("active_prompts", 0)),
+            )
+            for row in rows
+        ]
+        return {"items": [item.dict() for item in items]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/prompts/{doc_type}")
+async def admin_get_doc_type_prompts(doc_type: str, _: bool = Depends(admin_required)):
+    """
+    Haal alle prompts (extract/summary/risk) op voor één doc_type.
+    Retourneert altijd een structuur; bij geen bestaande prompts is 'prompts' leeg.
+    """
+    try:
+        records = prompt_repo.list_prompts_for_type(doc_type)
+        prompts: Dict[str, PromptDTO] = {}
+
+        for rec in records:
+            kind = str(rec["prompt_kind"])
+            prompts[kind] = PromptDTO(
+                doc_type=doc_type,
+                prompt_kind=kind,
+                template=str(rec["template"]),
+                max_context_tokens=rec.get("max_context_tokens"),
+                active=bool(rec.get("active", True)),
+            )
+
+        dto = DocTypePromptsDTO(doc_type=doc_type, prompts=prompts)
+        return dto.dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/prompts/{doc_type}")
+async def admin_put_doc_type_prompts(
+    doc_type: str,
+    payload: DocTypePromptsDTO,
+    _: bool = Depends(admin_required),
+):
+    """
+    Sla prompts voor een doc_type op in de document_prompts-tabel.
+    - Upsert per (doc_type, prompt_kind)
+    - Vult automatisch PromptStore opnieuw (load_prompts(force=True)).
+    """
+    try:
+        target_doc_type = (doc_type or payload.doc_type or "").strip()
+        if not target_doc_type:
+            raise HTTPException(status_code=400, detail="doc_type is required")
+
+        for kind, prompt in (payload.prompts or {}).items():
+            if not prompt.template:
+                continue
+            pkind = prompt.prompt_kind or kind
+            prompt_repo.upsert_prompt(
+                doc_type=target_doc_type,
+                prompt_kind=pkind,
+                template=prompt.template,
+                max_context_tokens=prompt.max_context_tokens,
+                active=prompt.active,
+            )
+
+        try:
+            load_prompt_store(force=True)
+        except Exception:
+            pass
+
+        return {"status": "saved", "doc_type": target_doc_type}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # Documents
 @app.get("/admin/docs")
 async def admin_docs(_: bool = Depends(admin_required)):
@@ -733,7 +813,8 @@ async def admin_docs_text(payload: Dict[str, Any], _: bool = Depends(admin_requi
             f.write(text)
         chunks = ing.chunk_texts([text], 500, 100)
         meta = {"source": name, "doc_id": name, "kind": "upload", "uploaded_by": "admin"}
-        ing.ingest_texts(vectorstore, chunks, meta, persist=True)
+        vs = EmbeddingsService.raw_vectorstore()
+        ing.ingest_texts(vs, chunks, meta, persist=True)
         return {"status": "ingested", "filename": name, "chunks": len(chunks)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -741,7 +822,8 @@ async def admin_docs_text(payload: Dict[str, Any], _: bool = Depends(admin_requi
 @app.delete("/admin/docs/{filename}")
 async def admin_docs_delete(filename: str, _: bool = Depends(admin_required)):
     try:
-        ing.delete_by_source(vectorstore, filename, persist=True)
+        vs = EmbeddingsService.raw_vectorstore()
+        ing.delete_by_source(vs, filename, persist=True)
     except Exception:
         pass
     try:
@@ -781,7 +863,8 @@ async def delete_project_document(project_id: str, doc_id: str, _: bool = Depend
             # Delete from vectorstore
             if filename:
                 try:
-                    ing.delete_by_source(vectorstore, filename, persist=True)
+                    vs = EmbeddingsService.raw_vectorstore()
+                    ing.delete_by_source(vs, filename, persist=True)
                 except Exception as e:
                     # Log but continue - vectorstore delete is best effort
                     print(f"Warning: Could not delete from vectorstore: {e}")
@@ -899,7 +982,8 @@ async def admin_approve_feedback(fid: str, body: ModerationIn, _: bool = Depends
         chunks = ing.chunk_texts([content], 500, 100)
         meta = {"source": f"feedback:{fid}", "doc_id": f"feedback:{fid}", "kind": "feedback", "uploaded_by": "moderator"}
         try:
-            ing.ingest_texts(vectorstore, chunks, meta, persist=True)
+            vs = EmbeddingsService.raw_vectorstore()
+            ing.ingest_texts(vs, chunks, meta, persist=True)
         except Exception:
             # still return success on moderation even if ingest fails
             pass
@@ -1236,16 +1320,25 @@ async def upload_project_documents(
     files: list[UploadFile] = File(...),
     _: bool = Depends(admin_required)
 ):
+    """
+    Upload één of meerdere projectdocumenten via de centrale DocumentIngestService.
+
+    - Schrijft documenten naar de documents-tabel met source_type='project_upload'
+    - Koppelt automatisch project_id/client_id
+    - Normaliseert/klasseert en indexeert via DocumentIngestService-pijplijn
+    """
     try:
         # Verify project exists
         project = cp.get_project(project_id)
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
-        
-        # Defensive: ensure files present
+
         if not files or len(files) == 0:
-            raise HTTPException(status_code=400, detail="No files uploaded. Field 'files' is required (multipart/form-data).")
-        
+            raise HTTPException(
+                status_code=400,
+                detail="No files uploaded. Field 'files' is required (multipart/form-data).",
+            )
+
         # Log basic request info
         try:
             print(f"[UPLOAD] project={project_id} files={len(files)}")
@@ -1253,97 +1346,91 @@ async def upload_project_documents(
             pass
 
         client_id = project.get("client_id")
-        uploaded_files = []
-        
-        ing.ensure_dirs()
-        uploads_dir = os.path.join(os.path.dirname(__file__), "fatrag_data", "uploads")
-        
-        import pymysql
-        conn = cp.get_db_connection()
-        
-        try:
-            for file in files:
-                try:
-                    fname = (file.filename or "").strip()
-                    if not fname:
-                        uploaded_files.append({
+        uploaded_files: list[dict[str, object]] = []
+
+        ingest_service = DocumentIngestService()
+
+        for file in files:
+            try:
+                fname = (file.filename or "").strip()
+                if not fname:
+                    uploaded_files.append(
+                        {
                             "filename": fname,
                             "status": "skipped",
-                            "reason": "Empty filename"
-                        })
-                        continue
-
-                    # Save file
-                    file_path = os.path.join(uploads_dir, fname)
-                    content = await file.read()
-                    if not content:
-                        uploaded_files.append({
-                            "filename": fname,
-                            "status": "skipped",
-                            "reason": "Empty file content"
-                        })
-                        continue
-
-                    with open(file_path, "wb") as f:
-                        f.write(content)
-                    
-                    # Ingest to vectorstore with project context
-                    result = ing.ingest_files(
-                        vectorstore,
-                        [file_path],
-                        user="admin",
-                        kind="project_upload",
-                        extra_metadata={"project_id": project_id, "client_id": client_id},
-                        persist=False,
+                            "reason": "Empty filename",
+                        }
                     )
-                    
-                    # Save to documents table
-                    doc_id = cp.generate_id("doc-")
-                    source_type = "project_upload"
-                    
-                    with conn.cursor() as cursor:
-                        sql = """
-                            INSERT INTO documents 
-                            (doc_id, project_id, client_id, filename, source_type, file_path, file_size, status)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """
-                        cursor.execute(sql, (
-                            doc_id,
-                            project_id,
-                            client_id,
-                            fname,
-                            source_type,
-                            file_path,
-                            len(content),
-                            "indexed"
-                        ))
-                    conn.commit()
-                    
-                    uploaded_files.append({
-                        "doc_id": doc_id,
-                        "filename": fname,
-                        "size": len(content),
-                        "status": "uploaded",
-                        "ingestion": result,
-                    })
-                except Exception as fe:
-                    # Log and continue with next file
-                    try:
-                        print(f"[UPLOAD-ERROR] project={project_id} file={getattr(file,'filename','?')} err={fe}")
-                    except Exception:
-                        pass
-                    uploaded_files.append({
+                    continue
+
+                # Laat DocumentIngestService volledige verwerking doen
+                result = await ingest_service.ingest_document(
+                    file=file,
+                    project_id=project_id,
+                    client_id=client_id,
+                    source_type="project_upload",
+                )
+
+                uploaded_files.append(
+                    {
+                        "doc_id": result.document_id,
+                        "filename": result.filename,
+                        "size": result.file_size,
+                        "status": result.status,
+                        "ingestion": {
+                            "status": result.status,
+                            "message": result.message,
+                            "source_type": "project_upload",
+                        },
+                    }
+                )
+            except Exception as fe:
+                # Log en ga door met volgende file (partial success gedrag behouden)
+                try:
+                    print(
+                        f"[UPLOAD-ERROR] project={project_id} file={getattr(file, 'filename', '?')} err={fe}"
+                    )
+                except Exception:
+                    pass
+                uploaded_files.append(
+                    {
                         "filename": getattr(file, "filename", ""),
                         "status": "error",
-                        "error": str(fe)
-                    })
-            
-            # Persist vectorstore once after all files
-            vectorstore.persist()
-            
-            return {"status": "success", "project_id": project_id, "files": uploaded_files}
-        finally:
-            conn.close()
+                        "error": str(fe),
+                    }
+                )
+
+        # Bepaal of er ten minste één geslaagde upload is
+        success_entries = [
+            f
+            for f in uploaded_files
+            if str(f.get("status", "")).lower() not in ("error", "skipped")
+        ]
+
+        if not success_entries:
+            # Geen enkel bestand is verwerkt → geef duidelijke fout terug
+            errors = []
+            for f in uploaded_files:
+                reason = f.get("error") or f.get("reason")
+                if isinstance(reason, str) and reason:
+                    errors.append(reason)
+            # Dedupe while preserving volgorde
+            seen = set()
+            unique_errors = []
+            for msg in errors:
+                if msg not in seen:
+                    seen.add(msg)
+                    unique_errors.append(msg)
+            detail = "Geen van de geüploade bestanden kon worden verwerkt."
+            if unique_errors:
+                detail += " Oorzaken: " + "; ".join(unique_errors[:3])
+            raise HTTPException(status_code=400, detail=detail)
+
+        return {
+            "status": "success",
+            "project_id": project_id,
+            "files": uploaded_files,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -3626,7 +3713,6 @@ async def upload_project_documents_with_progress(
         async def _background_ingest_with_progress():
             try:
                 result = ing_progress.ingest_files_batch_with_progress(
-                    vectorstore=vectorstore,
                     file_paths=file_paths,
                     batch_id=batch_id,
                     project_id=project_id,

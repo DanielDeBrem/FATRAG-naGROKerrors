@@ -1,0 +1,67 @@
+doc_type: "factuur"
+
+prompts:
+  extract:
+    template: |
+      Je bent een financiële assistent. Extraheer de kerngegevens uit de onderstaande factuur.
+      Focus op:
+      - factuurnummer
+      - factuurdatum
+      - vervaldatum / betalingstermijn
+      - leverancier (naam, KvK, BTW-nummer indien aanwezig)
+      - afnemer (naam, KvK, BTW-nummer indien aanwezig)
+      - totaalbedrag (incl. BTW)
+      - BTW-bedragen per tarief
+      - valuta
+      - omschrijving(en) van geleverde goederen/diensten
+      
+      Geef antwoord in geldig JSON met de volgende structuur:
+      {
+        "factuurnummer": "...",
+        "factuurdatum": "...",
+        "vervaldatum": "...",
+        "leverancier": {
+          "naam": "...",
+          "kvk": "...",
+          "btw_nummer": "..."
+        },
+        "afnemer": {
+          "naam": "...",
+          "kvk": "...",
+          "btw_nummer": "..."
+        },
+        "valuta": "...",
+        "totaal_incl_btw": ...,
+        "btw_per_tarief": [
+          {"tarief": "...", "grondslag": ..., "btw": ...}
+        ],
+        "regels": [
+          {"omschrijving": "...", "aantal": ..., "prijs_excl_btw": ..., "totaal_excl_btw": ...}
+        ]
+      }
+    max_context_tokens: 80000
+
+  summary:
+    template: |
+      Je bent een financieel administrateur. Vat de onderstaande factuur kort samen.
+      - Noem partijen, factuurnummer, datum en totaalbedrag incl. BTW.
+      - Noem belangrijkste regels (maximaal 5) met korte omschrijving en bedrag.
+      - Benoem bijzonderheden (bijzondere voorwaarden, ongewone kortingen, ongebruikelijke BTW).
+      
+      TEKST:
+      {text}
+    max_context_tokens: 100000
+
+  risk:
+    template: |
+      Je bent een fiscalist. Beoordeel de onderstaande factuur op fiscale en administratieve risico's:
+      - onzekerheden rond BTW-behandeling (tarief, vrijstelling, verleggingsregeling)
+      - inconsistenties in partijen/identificatie (naam, KvK, BTW-nummer)
+      - signalen van ongebruikelijke transacties of bedragen
+      - administratieve aandachtspunten (ontbrekende gegevens, onduidelijke omschrijving)
+      
+      Geef antwoord in puntsgewijze vorm, met "onvoldoende data" waar informatie ontbreekt.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 100000

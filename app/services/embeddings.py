@@ -46,6 +46,23 @@ class EmbeddingsService:
 
     - add_document_chunks: voegt chunks toe met consistente metadata.
     - get_retriever: levert een retriever met optionele filters.
+
+    Canoniek chunk-metadata schema (per chunk):
+
+    Verplicht:
+    - doc_id:      stabiele document-ID (matches documents.doc_id waar mogelijk)
+    - source_type: bron/type, bijv. 'upload', 'project_upload', 'llm_analysis', 'flash_analysis'
+
+    Aanbevolen:
+    - project_id:      scope naar project
+    - client_id:       scope naar client
+    - document_type:   classificatie (bijv. 'jaarrekening', 'aandeelhoudersovereenkomst')
+    - filename:        bestandsnaam zoals zichtbaar in uploads
+    - source:          gelijk aan filename (voor backwards compat: delete_by_source gebruikt dit)
+    - chunk_index:     0-based index van de chunk binnen het document
+
+    Extra velden (optioneel, via extra_metadata):
+    - path, uploaded_by, kind, file_type, enz.
     """
 
     @staticmethod
@@ -57,22 +74,15 @@ class EmbeddingsService:
         document_type: Optional[str],
         source_type: str,
         chunks: List[str],
+        filename: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
         persist: bool = True,
     ) -> int:
-        """Voeg chunks toe aan de vectorstore met consistente metadata.
-
-        Metadata bevat minimaal:
-        - doc_id
-        - project_id
-        - client_id
-        - document_type
-        - source_type
-        plus alles uit extra_metadata (bijv. filename).
-        """
+        """Voeg chunks toe aan de vectorstore met consistente, RAG-vriendelijke metadata."""
         if not chunks:
             return 0
 
+        # Basis: canonieke velden
         base_meta: Dict[str, Any] = {
             "doc_id": doc_id,
             "source_type": source_type,
@@ -83,14 +93,25 @@ class EmbeddingsService:
             base_meta["client_id"] = client_id
         if document_type:
             base_meta["document_type"] = document_type
+        if filename:
+            base_meta["filename"] = filename
+            # Backwards compat: delete_by_source(where={"source": filename})
+            base_meta["source"] = filename
 
+        # Extra metadata meenemen, maar canonieke keys niet overschrijven
         if extra_metadata:
-            base_meta.update(extra_metadata)
+            for key, value in extra_metadata.items():
+                if key not in base_meta:
+                    base_meta[key] = value
 
-        # Zelfde metadata voor alle chunks, eventueel later uitbreiden met chunk_index
-        metas = [base_meta for _ in chunks]
+        # Per chunk een eigen metadata-dict met chunk_index
+        metadatas: List[Dict[str, Any]] = []
+        for idx, _ in enumerate(chunks):
+            meta = dict(base_meta)
+            meta["chunk_index"] = idx
+            metadatas.append(meta)
 
-        _vectorstore.add_texts(texts=chunks, metadatas=metas)
+        _vectorstore.add_texts(texts=chunks, metadatas=metadatas)
         if persist:
             try:
                 _vectorstore.persist()

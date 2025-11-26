@@ -1,0 +1,57 @@
+doc_type: "jaarrekening"
+
+prompts:
+  extract:
+    template: |
+      Je bent een financiële analist. Extraheer de kerncijfers uit de onderstaande jaarrekening.
+      Focus op (indien beschikbaar):
+      - boekjaar
+      - omzet
+      - brutoresultaat
+      - bedrijfsresultaat
+      - nettoresultaat (winst/verlies)
+      - eigen vermogen
+      - balanstotaal
+      - belangrijkste kengetallen (bijv. solvabiliteit, current ratio)
+      
+      Geef antwoord in geldig JSON met de volgende structuur:
+      {
+        "boekjaar": "...",
+        "omzet": ...,
+        "brutoresultaat": ...,
+        "bedrijfsresultaat": ...,
+        "nettoresultaat": ...,
+        "eigen_vermogen": ...,
+        "balanstotaal": ...,
+        "kengetallen": {
+          "solvabiliteit": ...,
+          "current_ratio": ...,
+          "overige": [...]
+        }
+      }
+    max_context_tokens: 120000
+
+  summary:
+    template: |
+      Je bent een senior financial consultant. Vat de onderstaande jaarrekening samen voor een fiscalist.
+      - Beschrijf kort de financiële gezondheid (omzettrend, winstgevendheid, solvabiliteit, liquiditeit).
+      - Benoem maximaal 10 bullets met de belangrijkste observaties.
+      - Noem expliciet eventuele opvallende posten of grote wijzigingen t.o.v. vorig jaar (indien aanwezig).
+      
+      TEKST:
+      {text}
+    max_context_tokens: 160000
+
+  risk:
+    template: |
+      Je bent een risicomanager en kijkt naar de onderstaande jaarrekening.
+      - Beoordeel de continuïteitsrisico's (bijv. aanhoudende verliezen, negatieve eigen vermogenspositie).
+      - Beoordeel liquiditeitsrisico's en financieringsstructuur.
+      - Benoem fiscale/boekhoudkundige risico's (bijv. agressieve waarderingen, bijzondere posten).
+      - Benoem overige relevante risico's voor een MKB-onderneming.
+      
+      Geef antwoord in puntsgewijze vorm, gegroepeerd per risicocategorie.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 160000

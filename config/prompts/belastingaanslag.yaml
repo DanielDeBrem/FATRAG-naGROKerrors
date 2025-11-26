@@ -1,0 +1,62 @@
+doc_type: "belastingaanslag"
+
+prompts:
+  extract:
+    template: |
+      Je bent een fiscalist. Extraheer de kerngegevens uit de onderstaande belastingaanslag.
+      Focus op:
+      - soort belasting (IB, VPB, BTW, Loonheffing, Overdrachtsbelasting, etc.)
+      - belastingjaar / tijdvak
+      - soort beschikking (voorlopige aanslag, definitieve aanslag, navorderingsaanslag, naheffingsaanslag)
+      - aanslagnummer of kenmerk
+      - belastingplichtige (naam, BSN/RSIN indien aanwezig)
+      - grondslag(en) (bijv. belastbaar inkomen, winst, omzet)
+      - verschuldigde belasting en eventuele heffings-/invorderingsrente
+      - betaaltermijnen (bedrag per termijn, uiterste betaaldatums)
+      
+      Geef antwoord in geldig JSON met de volgende structuur:
+      {
+        "soort_belasting": "...",
+        "belastingjaar_of_tijdvak": "...",
+        "soort_beschikking": "...",
+        "aanslagnummer": "...",
+        "belastingplichtige": {
+          "naam": "...",
+          "bsn_of_rsin": "..."
+        },
+        "grondslagen": [...],
+        "verschuldigde_belasting": ...,
+        "rente": ...,
+        "betaaltermijnen": [
+          {"bedrag": ..., "vervaldatum": "..."}
+        ]
+      }
+    max_context_tokens: 80000
+
+  summary:
+    template: |
+      Je bent een fiscalist. Vat de onderstaande belastingaanslag samen.
+      - Licht kort toe:
+        - welk type aanslag het is
+        - voor welk jaar/tijdvak en welke belastingsoort
+        - grondslag en verschuldigde belasting
+        - betaaltermijnen en belangrijkste datums
+      - Gebruik maximaal 10 bullets.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 100000
+
+  risk:
+    template: |
+      Je bent een ervaren fiscalist. Beoordeel de onderstaande belastingaanslag op risico's en aandachtspunten:
+      - risico op onjuiste grondslag (bijv. schatting, ontbrekende gegevens, opvallend hoog/laag bedrag)
+      - juridische/fiscale risico's (termijnen bezwaar/beroep, navorderings-/naheffingsrisico's)
+      - liquiditeitsimpact en betalingsrisico's
+      - onduidelijkheden of inconsistenties in de aanslag
+      
+      Geef antwoord in puntsgewijze vorm, met "onvoldoende data" waar informatie ontbreekt.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 100000

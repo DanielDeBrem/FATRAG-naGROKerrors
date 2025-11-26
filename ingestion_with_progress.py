@@ -13,10 +13,10 @@ from typing import List, Dict, Any, Optional, Callable
 from langchain_community.vectorstores import Chroma
 import ingestion as ing
 from upload_progress_store import UploadProgressTracker, create_progress_callback
+from app.services.embeddings import EmbeddingsService
 
 
 def ingest_file_with_progress(
-    vectorstore: Chroma,
     file_path: str,
     upload_id: str,
     tracker: UploadProgressTracker,
@@ -39,6 +39,7 @@ def ingest_file_with_progress(
     
     filename = os.path.basename(file_path)
     callback = create_progress_callback(tracker, upload_id)
+    vectorstore = EmbeddingsService.raw_vectorstore()
     
     try:
         # Stage 1: File uploaded (already done by caller)
@@ -155,7 +156,6 @@ def ingest_file_with_progress(
 
 
 def ingest_files_batch_with_progress(
-    vectorstore: Chroma,
     file_paths: List[str],
     batch_id: str,
     project_id: str,
@@ -198,7 +198,6 @@ def ingest_files_batch_with_progress(
         
         # Ingest with progress tracking
         result = ingest_file_with_progress(
-            vectorstore=vectorstore,
             file_path=file_path,
             upload_id=upload_id,
             tracker=tracker,

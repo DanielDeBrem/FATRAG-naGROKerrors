@@ -1,0 +1,65 @@
+doc_type: "overeenkomst"
+
+prompts:
+  extract:
+    template: |
+      Je bent een juridisch-fiscale assistent. Extraheer de kerninformatie uit de onderstaande overeenkomst.
+      Focus op:
+      - partijen (namen + rol, bijv. opdrachtgever/opdrachtnemer, verhuurder/huurder)
+      - type overeenkomst (bijv. koop, dienstverlening, huurovereenkomst, lening)
+      - onderwerp en doel van de overeenkomst
+      - looptijd en opzegging (startdatum, einddatum, verlengingsopties)
+      - financiële afspraken (bedragen, termijnen, rente, boetes)
+      - zekerheden (borgtocht, pandrecht, hypotheek, garanties)
+      
+      Geef antwoord in geldig JSON met de volgende structuur:
+      {
+        "partijen": [
+          {"naam": "...", "rol": "..."},
+          ...
+        ],
+        "type_overeenkomst": "...",
+        "onderwerp": "...",
+        "looptijd": {
+          "startdatum": "...",
+          "einddatum": "...",
+          "verlenging": "..."
+        },
+        "financiele_afspraken": {
+          "bedragen": [...],
+          "betalingscondities": "...",
+          "rente": "...",
+          "boetes": "..."
+        },
+        "zekerheden": [...]
+      }
+    max_context_tokens: 120000
+
+  summary:
+    template: |
+      Je bent een juridisch-fiscale adviseur. Vat de onderstaande overeenkomst samen voor een fiscalist.
+      - Geef in maximaal 12 bullets weer:
+        - partijen en hun rol
+        - type en doel van de overeenkomst
+        - belangrijkste financiële afspraken
+        - looptijd en beëindigingsmogelijkheden
+        - voor de fiscalist relevante clausules (bijv. vrijwaringen, garanties, non-compete)
+      
+      TEKST:
+      {text}
+    max_context_tokens: 160000
+
+  risk:
+    template: |
+      Je bent een juridisch-fiscale risicomanager. Analyseer de onderstaande overeenkomst en beschrijf:
+      - juridische risico's (aansprakelijkheid, eenzijdige verplichtingen, onduidelijke clausules)
+      - financiële risico's (betalingsverplichtingen, garanties, zekerheden)
+      - fiscale risico's (bijv. schijnconstructies, ongebruikelijke prijs/voorwaarden, risico op herkwalificatie)
+      - operationele risico's (afhankelijkheid, lange looptijd, beëindigingsclausules)
+      
+      Geef antwoord in puntsgewijze vorm, gegroepeerd per categorie.
+      Gebruik "onvoldoende data" als informatie ontbreekt.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 160000

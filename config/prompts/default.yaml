@@ -1,0 +1,45 @@
+doc_type: "default"
+
+prompts:
+  extract:
+    template: |
+      Je bent een behulpzame financiële assistent.
+      Extraheer de belangrijkste gestructureerde gegevens uit de onderstaande tekst.
+      Focus op:
+      - betrokken partijen
+      - data (datums, bedragen, valuta)
+      - kernonderwerp (bijv. overeenkomst, factuur, aanslag, rapport)
+      
+      Geef antwoord in geldig JSON met vaste keys:
+      {
+        "partijen": [...],
+        "datums": [...],
+        "bedragen": [...],
+        "valuta": [...],
+        "kernonderwerp": "..."
+      }
+    max_context_tokens: 120000
+
+  summary:
+    template: |
+      Je bent een senior adviseur. Vat de onderstaande tekst kort en zakelijk samen.
+      - Gebruik maximaal ~15 bullets.
+      - Focus op wat een fiscalist/financieel adviseur moet weten.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 160000
+
+  risk:
+    template: |
+      Je bent een risicomanager. Analyseer de onderstaande tekst en beschrijf:
+      - inhoudelijke risico's
+      - juridische/fiscale risico's
+      - operationele risico's
+      - ontbrekende informatie of onzekerheden
+      
+      Geef antwoord in bullets, gegroepeerd per categorie.
+      
+      TEKST:
+      {text}
+    max_context_tokens: 160000

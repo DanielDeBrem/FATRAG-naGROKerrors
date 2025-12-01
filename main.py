@@ -1,14 +1,17 @@
 from fastapi import FastAPI, HTTPException, Request, Depends, UploadFile, File, Form, BackgroundTasks
+from fastapi import Query as FastAPIQuery
 from fastapi.responses import JSONResponse, FileResponse as FastAPIFileResponse
 from pydantic import BaseModel
-from langchain_ollama import ChatOllama
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from app.services.embeddings import EmbeddingsService
 from app.services.document_ingest import DocumentIngestService
 from app.repositories.prompts import PromptsRepository
+from app.repositories.documents import DocumentsRepository
 from app.models.dto.prompts import PromptDTO, DocTypePromptsDTO, PromptDocTypeOverviewDTO
 from document_prompts.store import load_prompts as load_prompt_store
+from config_runtime import is_cloud_model, cloud_provider
+from llm import build_llm_from_config, warmup_llm
+from rag import get_tone_phrases, PROMPT, STRICT_PROMPT, build_qa_chain
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -33,6 +36,7 @@ import json
 import logging
 from itertools import cycle
 import rag_enhancements as rag_enh
+from metrics_store import MetricsStore
 
 # ---------- Rate Limiting Setup ----------
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -210,72 +214,16 @@ app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 # Config state
 app.state.config = update_runtime_from_env(load_config())
 
+# Global metrics store for monitoring dashboard
+metrics_store = MetricsStore(metrics_dir="metrics")
+
 LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
 EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "gemma2:2b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./fatrag_chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "fatrag")
 
-# Multi-GPU worker routing for Ollama
-# Configure ports via OLLAMA_WORKER_PORTS="11434,11435,11436,11437,11438,11439,11440,11441"
-WORKER_PORTS = [int(p.strip()) for p in os.getenv("OLLAMA_WORKER_PORTS", "11434").split(",") if p.strip().isdigit()]
-if not WORKER_PORTS:
-    WORKER_PORTS = [11434]
-_app_ports_cycle = cycle(WORKER_PORTS)
 
-def pick_worker_base_url() -> str:
-    """
-    Pick an Ollama worker base URL.
-    If FORCE_SINGLE_PORT=true, route all traffic to OLLAMA_BASE_URL (default :11434).
-    Otherwise, round-robin over WORKER_PORTS.
-    """
-    force = os.getenv("FORCE_SINGLE_PORT", "true").lower() in ("1", "true", "yes")
-    if force:
-        return os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    try:
-        port = next(_app_ports_cycle)
-    except Exception:
-        port = WORKER_PORTS[0]
-    return f"http://127.0.0.1:{port}"
-
-# Cloud routing detection (Ollama Cloud via local base URL)
-def is_cloud_model(cfg: Dict[str, Any], model_name: Optional[str]) -> bool:
-    """
-    Determine if the current model is routed to cloud even if base_url is local.
-    Precedence:
-      1) Env OLLAMA_CLOUD_ROUTED=true
-      2) Config OLLAMA_CLOUD_ROUTED=true
-      3) Config CLOUD_MODELS includes model name (exact match)
-      4) Heuristics on model name (contains ':cloud' or endswith '-cloud')
-    """
-    try:
-        if str(os.getenv("OLLAMA_CLOUD_ROUTED", "")).lower() in ("1", "true", "yes"):
-            return True
-        if str((cfg or {}).get("OLLAMA_CLOUD_ROUTED", "")).lower() in ("1", "true", "yes"):
-            return True
-        clouds = (cfg or {}).get("CLOUD_MODELS") or []
-        if isinstance(clouds, str):
-            try:
-                clouds = json.loads(clouds)
-            except Exception:
-                clouds = [c.strip() for c in clouds.split(",") if c.strip()]
-        if isinstance(clouds, list) and model_name and model_name in clouds:
-            return True
-        m = (model_name or "").lower()
-        if ":cloud" in m or m.endswith("-cloud"):
-            return True
-    except Exception:
-        pass
-    return False
-
-def cloud_provider(cfg: Dict[str, Any]) -> str:
-    """
-    Returns cloud provider name if known (from config/env), else 'cloud'.
-    """
-    prov = (cfg or {}).get("OLLAMA_CLOUD_PROVIDER") or os.getenv("OLLAMA_CLOUD_PROVIDER") or (cfg or {}).get("LLM_PROVIDER")
-    if isinstance(prov, str) and prov.strip():
-        return prov.strip()
-    return "cloud"
 
 # Professional financial advisory tone phrases per language
 TONE_PHRASES = {
@@ -386,78 +334,6 @@ Antwoord UITSLUITEND in {lang_hint}, FinAdviseur-NL stijl:
 """
 STRICT_PROMPT = PromptTemplate(template=strict_prompt_template, input_variables=["context", "question", "lang_hint", "tone_phrases"])
 
-def build_llm_from_config(cfg: Dict[str, Any]) -> ChatOllama:
-    model = cfg.get("LLM_MODEL") or os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
-    base_url = cfg.get("OLLAMA_BASE_URL") or pick_worker_base_url()
-    temperature = cfg.get("TEMPERATURE", 0.7)
-    # Adaptive timeout: longer for cloud/large models; override with LLM_TIMEOUT if set
-    try:
-        timeout = int(cfg.get("LLM_TIMEOUT", 30) or 30)
-    except Exception:
-        timeout = 30
-    try:
-        if is_cloud_model(cfg, model) and timeout < 90:
-            timeout = 90
-    except Exception:
-        pass
-    return ChatOllama(
-        model=model,
-        base_url=base_url,
-        temperature=temperature,
-        timeout=timeout,
-    )
-
-
-def build_qa_chain(
-    cfg: Dict[str, Any],
-    lang_hint: str = "",
-    tone_phrases: str = "",
-    prompt: PromptTemplate = PROMPT,
-    search_filter: Optional[Dict[str, Any]] = None,
-) -> RetrievalQA:
-    """Bouw een QA-keten met een retriever die project-/client-/typefilters ondersteunt.
-
-    Let op:
-    - EmbeddingsService.get_retriever() gebruikt metadata als project_id/client_id/document_type
-      die tijdens indexeren in de vectorstore zijn gezet.
-    - search_filter (indien meegegeven) wordt gemerged als extra filter.
-    """
-    k = int(cfg.get("RETRIEVER_K", 5) or 5)
-
-    # EmbeddingsService zorgt voor consistente filters & toegang tot vectorstore
-    retriever = EmbeddingsService.get_retriever(
-        k=k,
-        # project_id/client_id worden al in search_filter gezet in /query; hier gebruiken we
-        # extra_filter om bestaande logica niet te breken en toch centrale filtering te hebben.
-        extra_filter=search_filter or {},
-    )
-
-    return RetrievalQA.from_chain_type(
-        llm=build_llm_from_config(cfg),
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": prompt.partial(lang_hint=lang_hint, tone_phrases=tone_phrases)},
-    )
-
-
-async def warmup_llm(cfg: Dict[str, Any]) -> None:
-    """
-    Best-effort warmup with exponential backoff to ensure the selected model loads.
-    """
-    try:
-        llm = build_llm_from_config(cfg)
-        delays = [0.0, 0.5, 1.0, 2.0]
-        for d in delays:
-            if d:
-                await asyncio.sleep(d)
-            try:
-                await llm.ainvoke("ping")
-                break
-            except Exception:
-                continue
-    except Exception:
-        # Warmup failures should not break the API
-        pass
 
 @app.post("/query")
 async def query(q: Query):
@@ -612,6 +488,97 @@ def _job_set_stage(job_id: str, stage: str, progress: Optional[int] = None, extr
 @app.get("/admin/health")
 async def admin_health(_: bool = Depends(admin_required)):
     return {"status": "ok"}
+
+
+@app.get("/admin/system/status")
+async def admin_system_status(_: bool = Depends(admin_required)):
+    """
+    Lightweight snapshot for header bar:
+    - CPU load per logical CPU (0-100)
+    - GPU utilization per device (0-100) if available
+    - Summary of running/queued jobs
+    """
+    try:
+        # CPU metrics
+        cpu_load: list[float] = []
+        try:
+            import psutil  # type: ignore
+            cpu_load = psutil.cpu_percent(percpu=True)
+        except Exception:
+            # Fallback: derive a single load value from system load average
+            try:
+                one, _, _ = os.getloadavg()
+                cores = os.cpu_count() or 1
+                util = max(0.0, min(100.0, (one / cores) * 100.0))
+                cpu_load = [round(util, 1)]
+            except Exception:
+                cpu_load = []
+
+        # GPU metrics (best-effort via nvidia-smi)
+        gpus: list[Dict[str, Any]] = []
+        try:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 2:
+                        try:
+                            idx = int(parts[0])
+                            util = float(parts[1])
+                            gpus.append({"index": idx, "util": util})
+                        except ValueError:
+                            continue
+        except Exception:
+            gpus = []
+
+        # Job summary (last N jobs)
+        running = 0
+        queued = 0
+        latest = ""
+        try:
+            jobs = js.list_jobs(limit=20)
+            for j in jobs or []:
+                status = str(j.get("status") or "").lower()
+                if status in {
+                    "running",
+                    "initializing",
+                    "preempting_gpu",
+                    "running_pipeline",
+                    "running_l1_analysis",
+                    "saving_outputs",
+                    "generating",
+                    "analyzing",
+                }:
+                    running += 1
+                elif status in {"queued"}:
+                    queued += 1
+            if jobs:
+                j0 = jobs[0]
+                latest = f"{j0.get('job_type','')} ({j0.get('status','')})"
+        except Exception:
+            pass
+
+        return {
+            "cpu": cpu_load,
+            "gpus": gpus,
+            "jobs": {
+                "running": running,
+                "queued": queued,
+                "latest": latest,
+            },
+            "server_time": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/admin/config")
 async def get_config(_: bool = Depends(admin_required)):
@@ -897,6 +864,41 @@ async def delete_project_document(project_id: str, doc_id: str, _: bool = Depend
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/projects/{project_id}/documents/{doc_id}/download")
+async def download_project_document(project_id: str, doc_id: str, _: bool = Depends(admin_required)):
+    """
+    Download a project document by its doc_id.
+
+    This uses the DocumentsRepository to look up the document and serves the
+    underlying file path directly, so the frontend alleen het doc_id hoeft te kennen.
+    """
+    try:
+        repo = DocumentsRepository()
+        doc = repo.get_document_by_id(doc_id)
+
+        if not doc or doc.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if not doc.storage_path or not os.path.isfile(doc.storage_path):
+            raise HTTPException(status_code=404, detail="File not found")
+
+        import mimetypes
+
+        media_type, _ = mimetypes.guess_type(doc.storage_path)
+        if not media_type:
+            media_type = "application/octet-stream"
+
+        return FastAPIFileResponse(
+            doc.storage_path,
+            filename=doc.filename,
+            media_type=media_type,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.delete("/admin/api/outputs/{dirname}")
 async def delete_output_directory(dirname: str, _: bool = Depends(admin_required)):
@@ -1312,6 +1314,49 @@ async def archive_project(project_id: str, _: bool = Depends(admin_required)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.delete("/admin/projects/{project_id}/hard-delete")
+async def hard_delete_project(project_id: str, _: bool = Depends(admin_required)):
+    """
+    Permanently delete a project.
+
+    Safety:
+    - Unlinks all documents from this project (project_id -> NULL) but keeps the documents zelf.
+    - Relies on ON DELETE CASCADE to remove related organograms.
+    - Idempotent: meerdere DELETE-calls geven geen fout (ook als het project al weg is).
+    """
+    try:
+        conn = cp.get_db_connection()
+        try:
+            with conn.cursor() as cursor:
+                # Unlink documents from this project but keep the files and embeddings
+                cursor.execute(
+                    "UPDATE documents SET project_id = NULL WHERE project_id = %s",
+                    (project_id,),
+                )
+                unlinked_docs = cursor.rowcount
+
+                # Delete the project row itself (organograms are deleted via FK cascade)
+                cursor.execute(
+                    "DELETE FROM projects WHERE project_id = %s",
+                    (project_id,),
+                )
+                deleted_rows = cursor.rowcount
+
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Altijd een succes teruggeven; DELETE is idempotent
+        return {
+            "status": "deleted",
+            "project_id": project_id,
+            "unlinked_documents": unlinked_docs,
+            "deleted_rows": deleted_rows,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ========== DOCUMENT UPLOAD & ANALYSIS ENDPOINTS ==========
 
 @app.post("/admin/projects/{project_id}/upload")
@@ -1439,12 +1484,22 @@ async def upload_project_documents(
 # ---------- Helper: Map-Reduce LLM analysis over project documents ----------
 import asyncio as _asyncio
 
-async def analyze_project_documents_map_reduce(project: Dict[str, Any], documents: list[Dict[str, Any]]) -> str:
+async def analyze_project_documents_map_reduce(
+    project: Dict[str, Any],
+    documents: list[Dict[str, Any]],
+    job_id: Optional[str] = None,
+) -> str:
     """
     Map-Reduce analyse:
     - Map: per chunk korte, financiële bullets (NL, zonder rommel/footers)
     - Reduce: combineer tot één coherente analyse voor financieel professional
     - Regels: NL, bullets, geen PII, 'onvoldoende data' wanneer nodig
+
+    Indien job_id is meegegeven, wordt voortgang in jobs-metadata en progress
+    bijgewerkt zodat de admin-UI gedetailleerde status kan tonen:
+    - current_document
+    - processed_documents / total_documents
+    - stages[] timeline (mapping → reduce_prepare → reducing)
     """
     uploads_dir = os.path.join(os.path.dirname(__file__), "fatrag_data", "uploads")
     cfg = getattr(app.state, "config", {}) or {}
@@ -1453,15 +1508,42 @@ async def analyze_project_documents_map_reduce(project: Dict[str, Any], document
     map_summaries: list[str] = []
     doc_summaries: list[str] = []
 
+    docs_total = max(len(documents), 1)
+    processed_docs = 0
+    last_progress = 0
+
+    if job_id:
+        try:
+            _job_set_stage(
+                job_id,
+                "mapping",
+                progress=20,
+                extra={
+                    "total_documents": len(documents),
+                    "processed_documents": 0,
+                },
+            )
+            last_progress = 20
+        except Exception:
+            pass
+
     for doc in documents:
         filename = doc.get("filename", "")
         if not filename:
             continue
-        file_path = os.path.join(uploads_dir, filename)
+
+        # Bepaal fysiek pad:
+        # - bij nieuwe ingest-pijplijn staat het in documents.file_path (storage_path)
+        # - fallback: oude gedrag via uploads_dir/filename
+        file_path = doc.get("file_path") or doc.get("storage_path")
+        if not file_path or not os.path.isfile(file_path):
+            file_path = os.path.join(uploads_dir, filename)
+
         if not os.path.isfile(file_path):
+            # Als het bestand echt niet bestaat, sla dit document over
             continue
 
-        ext = os.path.splitext(filename)[1].lower()
+        ext = os.path.splitext(file_path)[1].lower()
         # Extract cleaned text using ingestion helpers
         if ext == ".pdf":
             text = ing.read_pdf_file(file_path)
@@ -1532,9 +1614,60 @@ Geef uitsluitend bullets:
                 # Skip failed chunk maps but continue
                 continue
 
+        # Document is volledig gemapt
+        processed_docs += 1
+        if job_id:
+            try:
+                frac = processed_docs / docs_total
+                progress = 20 + int(frac * 60)  # 20% → 80% tijdens mapping
+                if progress > 98:
+                    progress = 98
+                if progress >= last_progress + 3:
+                    _job_set_stage(
+                        job_id,
+                        "mapping",
+                        progress=progress,
+                        extra={
+                            "current_document": filename,
+                            "processed_documents": processed_docs,
+                            "total_documents": len(documents),
+                        },
+                    )
+                    last_progress = progress
+            except Exception:
+                pass
+
     # If nothing mapped, early signal
     if not map_summaries:
+        if job_id:
+            try:
+                _job_set_stage(
+                    job_id,
+                    "no_data",
+                    progress=100,
+                    extra={"error_message": "geen financiële informatie uit documenten"},
+                )
+            except Exception:
+                pass
         return "onvoldoende data: geen financiële informatie uit documenten kunnen extraheren."
+
+    # Prepare for reduce phase
+    if job_id:
+        try:
+            target = max(last_progress, 80)
+            _job_set_stage(
+                job_id,
+                "reduce_prepare",
+                progress=target,
+                extra={
+                    "mapped_documents": processed_docs,
+                    "total_documents": len(documents),
+                    "map_summaries": len(map_summaries),
+                },
+            )
+            last_progress = target
+        except Exception:
+            pass
 
     # Reduce: produce thorough but structured professional analysis (NL, bullets)
     # To respect 30s per-call timeouts, do a batched two-step reduce if the evidence is large.
@@ -1573,11 +1706,20 @@ Maak bullets:
             if out:
                 partials.append(out)
             await asyncio.sleep(0)  # yield
+
     # Synthesis prompt (either from partials or directly from all evidence)
     if partials:
         synth_input = "\n\n".join(partials)
     else:
-        synth_input = (chr(10)*2).join(map_summaries)
+        synth_input = (chr(10) * 2).join(map_summaries)
+
+    if job_id:
+        try:
+            target = max(last_progress, 90)
+            _job_set_stage(job_id, "reducing", progress=target)
+            last_progress = target
+        except Exception:
+            pass
 
     reduce_prompt = f"""
 Je bent FinAdviseur-NL. Combineer onderstaande bewijsregels tot één grondige, coherente analyse.
@@ -1607,6 +1749,16 @@ Maak de volgende secties (allemaal bullets):
     out = await _llm_call(reduce_prompt)
     if out:
         return out
+    if job_id:
+        try:
+            _job_set_stage(
+                job_id,
+                "failed",
+                progress=100,
+                extra={"error_message": "reduce-fase mislukt (timeout of model niet beschikbaar)"},
+            )
+        except Exception:
+            pass
     return "onvoldoende data: reduce-fase mislukt (timeout of model niet beschikbaar)"
 
 @app.post("/admin/projects/{project_id}/analyze-all")
@@ -1900,7 +2052,7 @@ async def _background_analyze_job(job_id: str, project_id: str) -> None:
             _job_set_stage(job_id, "analyzing", progress=60)
         except Exception:
             pass
-        analysis_text = await analyze_project_documents_map_reduce(project, documents)
+        analysis_text = await analyze_project_documents_map_reduce(project, documents, job_id=job_id)
 
         # Save as new document
         uploads_dir = os.path.join(os.path.dirname(__file__), "fatrag_data", "uploads")
@@ -1970,12 +2122,13 @@ async def analyze_all_project_documents_async(project_id: str, background_tasks:
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------- Flash Analysis (30-90s ultra-fast scan) ----------
-async def _background_flash_analysis(job_id: str, project_id: str) -> None:
+async def _background_flash_analysis(job_id: str, project_id: str, selected_doc_ids: Optional[List[str]] = None) -> None:
     """
     Run flash analysis using scripts/flash_analysis.py
     - Ultra-fast: only llama3.1:8b, aggressive chunking
     - Map → Reduce only (no Final stage)
     - Output: compact bullet report (1-2 pages)
+    - If selected_doc_ids is provided, only analyze those documents
     """
     try:
         # Initialize telemetry as early as possible
@@ -2140,10 +2293,16 @@ async def _background_flash_analysis(job_id: str, project_id: str) -> None:
 async def run_flash_analysis(
     project_id: str,
     background_tasks: BackgroundTasks,
+    body: Optional[Dict[str, Any]] = None,
     _: bool = Depends(admin_required)
 ):
     """
     Run ultra-fast Flash Analysis (30-90 seconds).
+    
+    Body (optional):
+    {
+        "selected_doc_ids": ["doc-xxx", "doc-yyy"]  // Optional: specific documents to analyze
+    }
     
     This endpoint:
     - Uses only llama3.1:8b for speed
@@ -2160,6 +2319,11 @@ async def run_flash_analysis(
         if not project:
             raise HTTPException(status_code=404, detail="Project not found")
 
+        # Extract selected document IDs from body (optional)
+        selected_doc_ids = []
+        if body and isinstance(body, dict):
+            selected_doc_ids = body.get("selected_doc_ids", [])
+
         # Create background job
         job_id = cp.generate_id("job-")
         cfg = getattr(app.state, "config", {}) or {}
@@ -2171,21 +2335,23 @@ async def run_flash_analysis(
             metadata={
                 "source": "admin_ui",
                 "mode": "flash",
-                "model": flash_model
+                "model": flash_model,
+                "selected_docs": len(selected_doc_ids) if selected_doc_ids else "all"
             }
         )
 
         if not job:
             raise HTTPException(status_code=500, detail="Failed to create flash analysis job")
 
-        # Start background task
-        background_tasks.add_task(_background_flash_analysis, job_id, project_id)
+        # Start background task with optional doc filter
+        background_tasks.add_task(_background_flash_analysis, job_id, project_id, selected_doc_ids)
 
         return {
             "status": "queued",
             "job_id": job_id,
             "message": "Flash Analysis started. Expected completion in 30-90 seconds.",
             "model": flash_model,
+            "selected_documents": len(selected_doc_ids) if selected_doc_ids else "all",
             "track_progress": f"/admin/jobs/{job_id}"
         }
 
@@ -2193,6 +2359,183 @@ async def run_flash_analysis(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ========== METRICS & MONITORING ENDPOINTS ==========
+
+@app.get("/api/metrics/stats")
+async def get_metrics_stats(
+    type: str = FastAPIQuery(..., alias="type"),
+    limit: int = FastAPIQuery(50, ge=1, le=500),
+    _: bool = Depends(admin_required),
+):
+    """
+    Aggregated performance stats for a given analysis type.
+    Used by /admin/monitor.html.
+    """
+    try:
+        stats = metrics_store.get_analysis_stats(analysis_type=type, limit=limit)
+        return stats
+    except ValueError as ve:
+        # Friendly error payload consumed by frontend
+        return {"error": str(ve)}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Kon metriekstatistieken niet ophalen: {str(e)}",
+        )
+
+
+@app.get("/api/metrics/compare")
+async def compare_metrics_configs(
+    type: str = FastAPIQuery(..., alias="type"),
+    key: str = FastAPIQuery("model", alias="key"),
+    _: bool = Depends(admin_required),
+):
+    """
+    Compare performance across different config values for an analysis type.
+    Used by /admin/monitor.html config comparison cards.
+    """
+    try:
+        data = metrics_store.compare_configs(analysis_type=type, config_key=key)
+        return data
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Kon configuratievergelijking niet ophalen: {str(e)}",
+        )
+
+
+class RunTestsRequest(BaseModel):
+    test_type: str
+    project_id: Optional[str] = None
+
+
+@app.post("/api/run-tests")
+async def run_monitoring_tests(
+    body: RunTestsRequest,
+    background_tasks: BackgroundTasks,
+    _: bool = Depends(admin_required),
+):
+    """
+    Start auto-test runs for monitoring dashboard.
+    test_type: 'flash' | 'grondige' | 'templates' | 'all'
+    """
+    test_type = (body.test_type or "all").lower().strip()
+    if test_type not in ("flash", "grondige", "templates", "all"):
+        raise HTTPException(
+            status_code=400,
+            detail="Ongeldige test_type. Gebruik 'flash', 'grondige', 'templates' of 'all'.",
+        )
+
+    # Create a Job row to track this long-running monitoring test run
+    try:
+        job_id = cp.generate_id("job-")
+        metadata = {
+            "source": "monitor_dashboard",
+            "test_type": test_type,
+            "project_id": body.project_id,
+        }
+        job = js.create_job(
+            job_id,
+            "monitoring_auto_test",
+            project_id=body.project_id,
+            metadata=metadata,
+        )
+        if not job:
+            raise HTTPException(
+                status_code=500,
+                detail="Kon geen job aanmaken voor de test-run.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Technische fout bij aanmaken van job: {str(e)}",
+        )
+
+    def _background_run_tests():
+        """
+        Run the requested tests and update job status.
+        Executes scripts/auto_test_analyses.py in a subprocess so existing
+        MetricsStore logic is reused.
+        """
+        try:
+            try:
+                js.update_job(job_id, status="running", progress=5)
+            except Exception:
+                pass
+
+            scripts_dir = os.path.join(os.path.dirname(__file__), "scripts")
+            script_path = os.path.join(scripts_dir, "auto_test_analyses.py")
+
+            cmd = ["python3", script_path]
+            if body.project_id:
+                cmd.extend(["--project", body.project_id])
+
+            if test_type == "flash":
+                cmd.append("--flash-only")
+            elif test_type == "grondige":
+                cmd.append("--grondige-only")
+            elif test_type == "templates":
+                cmd.append("--templates-only")
+            # "all" runs full suite with no extra flags
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=os.path.dirname(__file__),
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,  # 1 hour safe upper bound
+                )
+            except subprocess.TimeoutExpired:
+                try:
+                    js.update_job(
+                        job_id,
+                        status="failed",
+                        progress=0,
+                        error_message="Auto-test timeout na 1 uur.",
+                    )
+                except Exception:
+                    pass
+                return
+
+            if proc.returncode != 0:
+                error_msg = (proc.stderr or "").strip()[:500] or "auto_test_analyses.py is mislukt"
+                try:
+                    js.update_job(
+                        job_id,
+                        status="failed",
+                        progress=0,
+                        error_message=error_msg,
+                    )
+                except Exception:
+                    pass
+                return
+
+            try:
+                js.update_job(job_id, status="completed", progress=100)
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                js.update_job(
+                    job_id,
+                    status="failed",
+                    progress=0,
+                    error_message=str(e),
+                )
+            except Exception:
+                pass
+
+    background_tasks.add_task(_background_run_tests)
+
+    return {
+        "status": "started",
+        "job_id": job_id,
+        "message": "Test-run gestart. Dashboard wordt bijgewerkt zodra resultaten beschikbaar zijn.",
+    }
 
 # ========== PROGRESSIVE TESTING ENDPOINTS ==========
 
@@ -2656,8 +2999,13 @@ async def _background_fatrag_pipeline(job_id: str, project_id: str, research_que
         if not project:
             js.update_job(job_id, status="failed", error_message="Project not found")
             return
-        
+
         documents = project.get("documents", [])
+        
+        # Filter documents if specific IDs were provided
+        if selected_doc_ids:
+            documents = [d for d in documents if d.get("doc_id") in selected_doc_ids]
+        
         if not documents:
             js.update_job(job_id, status="failed", error_message="No documents to analyze")
             return
@@ -3592,14 +3940,31 @@ async def analyze_document(filename: str, _: bool = Depends(admin_required)):
 
 @app.get("/admin/docs/{filename}/download")
 async def download_document(filename: str, _: bool = Depends(admin_required)):
+    """
+    Download or view a document from the uploads directory.
+
+    For PDFs we set Content-Type to application/pdf so the browser can render
+    the document inline in its PDF viewer instead of showing a blank page.
+    """
     try:
         uploads_dir = os.path.join(os.path.dirname(__file__), "fatrag_data", "uploads")
         file_path = os.path.join(uploads_dir, filename)
-        
+
         if not os.path.isfile(file_path):
             raise HTTPException(status_code=404, detail="File not found")
-        
-        return FastAPIFileResponse(file_path, filename=filename)
+
+        import mimetypes
+
+        media_type, _ = mimetypes.guess_type(file_path)
+        if not media_type:
+            media_type = "application/octet-stream"
+
+        # For PDFs, use application/pdf so browsers show the document
+        return FastAPIFileResponse(
+            file_path,
+            filename=filename,
+            media_type=media_type,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -4406,5 +4771,29 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() in ("1", "true", "yes")
 
-    print(f"Starting FATRAG API on http://{host}:{port}")
-    uvicorn.run("main:app", host=host, port=port, reload=reload_flag)
+    # When running in reload mode, build reload_excludes from .reload-exclude and .clineignore
+    reload_excludes: list[str] = []
+    if reload_flag:
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        for fname in (".reload-exclude", ".clineignore"):
+            fpath = os.path.join(project_root, fname)
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            reload_excludes.append(line)
+                except Exception:
+                    # Fail-soft: never block startup if exclude files cannot be read
+                    pass
+
+    print(f"Starting FATRAG API on http://{host}:{port} (reload={reload_flag}, reload_excludes={reload_excludes})")
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        reload=reload_flag,
+        reload_excludes=reload_excludes or None,
+    )
